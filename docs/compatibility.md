@@ -88,6 +88,13 @@ a transactional producer fails at `initTransactions()` with
 TransactionalIdAuthorizationException. The broker still advertises the other transaction APIs,
 but a client cannot start a transaction to use them.
 
+The in-memory and S3 engines answer a retry of one of an idempotent producer's last 5 batches to
+a partition as Kafka does: with no error and the offset of the stored batch. They answer any
+other batch that does not start at the producer's next sequence with
+OUT_OF_ORDER_SEQUENCE_NUMBER. The PostgreSQL and SQLite engines answer every batch whose sequence
+is below the next one with DUPLICATE_SEQUENCE_NUMBER and base offset -1, and do not store it. A
+client counts that answer as delivered.
+
 | API | Key | Versions | PostgreSQL | SQLite | In-memory | S3 | Notes |
 | --- | --: | --- | --- | --- | --- | --- | --- |
 | InitProducerId | 22 | 0-5 | Partial | Partial | Partial | Partial | Gives a producer ID to an idempotent producer. Refuses a request with a `transactional.id`. |

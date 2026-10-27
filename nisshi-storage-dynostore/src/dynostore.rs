@@ -79,6 +79,7 @@ use opentelemetry::{
 };
 use opticon::OptiCon;
 use percent_encoding::percent_decode_str;
+use produced_batches::{ProducedBatches, SequenceCheck};
 use rand::{prelude::*, rng};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use time_index::TimeIndex;
@@ -89,6 +90,7 @@ use uuid::Uuid;
 
 mod metadata;
 mod opticon;
+mod produced_batches;
 mod time_index;
 
 #[cfg(test)]
@@ -405,6 +407,74 @@ impl Meta {
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 struct ProducerDetail {
     sequences: BTreeMap<ProducerEpoch, BTreeMap<String, BTreeMap<i32, Sequence>>>,
+    /// The batches that the producer last wrote to each partition, at its newest epoch only.
+    ///
+    /// A partition's newest remembered batch ends just before its next sequence in
+    /// `sequences`. Only the advance that follows a record write changes either of them, and
+    /// it changes both. A partition has no entry when its sequence was stored before the broker
+    /// remembered batches.
+    #[serde(default)]
+    batches: BTreeMap<ProducerEpoch, BTreeMap<String, BTreeMap<i32, ProducedBatches>>>,
+}
+
+impl ProducerDetail {
+    /// Returns the sequence that the producer's next batch to the partition must start at, at
+    /// `epoch`.
+    fn next_sequence(&self, epoch: ProducerEpoch, topition: &Topition) -> Sequence {
+        self.sequences
+            .get(&epoch)
+            .and_then(|topics| topics.get(&topition.topic))
+            .and_then(|partitions| partitions.get(&topition.partition))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Returns the batches that the producer last wrote to the partition at `epoch`, or `None`
+    /// when the partition's sequence was stored before the broker remembered batches.
+    fn remembered_batches(
+        &self,
+        epoch: ProducerEpoch,
+        topition: &Topition,
+    ) -> Option<&ProducedBatches> {
+        self.batches
+            .get(&epoch)
+            .and_then(|topics| topics.get(&topition.topic))
+            .and_then(|partitions| partitions.get(&topition.partition))
+    }
+
+    /// Records a batch stored at `base_offset`: advances the partition's next sequence past the
+    /// batch, and remembers the batch.
+    ///
+    /// Forgets the batches of every older epoch, because only a batch at the producer's newest
+    /// epoch can be a duplicate.
+    fn advance(
+        &mut self,
+        epoch: ProducerEpoch,
+        topition: &Topition,
+        base_sequence: Sequence,
+        last_offset_delta: i32,
+        base_offset: i64,
+    ) {
+        *self
+            .sequences
+            .entry(epoch)
+            .or_default()
+            .entry(topition.topic.clone())
+            .or_default()
+            .entry(topition.partition)
+            .or_default() += last_offset_delta + 1;
+
+        self.batches.retain(|remembered, _| *remembered >= epoch);
+
+        self.batches
+            .entry(epoch)
+            .or_default()
+            .entry(topition.topic.clone())
+            .or_default()
+            .entry(topition.partition)
+            .or_default()
+            .remember(base_sequence, last_offset_delta, base_offset);
+    }
 }
 
 /// Allocates a new producer ID, one more than the newest, and gives it epoch 0.
@@ -421,6 +491,7 @@ fn allocate_producer_id(
         id,
         ProducerDetail {
             sequences: BTreeMap::from([(0, BTreeMap::new())]),
+            batches: BTreeMap::new(),
         },
     );
 
@@ -2028,7 +2099,8 @@ impl Storage for DynoStore {
             // client's mandatory retry, for a duplicate of a batch that
             // was never actually written.
             if deflated.is_idempotent() {
-                self.meta
+                let check = self
+                    .meta
                     .with(&self.object_store, |meta| {
                         let Some(pd) = meta.producers.get(&deflated.producer_id) else {
                             debug!(producer_id = deflated.producer_id, ?meta.producers);
@@ -2045,40 +2117,69 @@ impl Storage for DynoStore {
                             return Err(Error::Api(ErrorCode::ProducerFenced));
                         }
 
-                        let sequence = sequences
-                            .get(&topition.topic)
-                            .and_then(|partitions| partitions.get(&topition.partition))
-                            .copied()
-                            .unwrap_or_default();
+                        debug!(?sequences);
+                        let sequence = pd.next_sequence(*current_epoch, topition);
+                        let remembered_batches = pd.remembered_batches(*current_epoch, topition);
 
-                        match sequence {
-                            sequence if sequence < deflated.base_sequence => {
+                        produced_batches::check_sequence(
+                            sequence,
+                            remembered_batches,
+                            deflated.base_sequence,
+                            deflated.last_offset_delta,
+                        )
+                        .inspect_err(|err| {
+                            // A client treats this answer as fatal, and stops the producer.
+                            if matches!(err, Error::Api(ErrorCode::OutOfOrderSequenceNumber)) {
+                                warn!(
+                                    producer_id = deflated.producer_id,
+                                    producer_epoch = deflated.producer_epoch,
+                                    ?topition,
+                                    next_sequence = sequence,
+                                    base_sequence = deflated.base_sequence,
+                                    last_offset_delta = deflated.last_offset_delta,
+                                    ?remembered_batches,
+                                    "idempotent batch out of order: it does not start at the next \
+                                     sequence and does not repeat a recent batch"
+                                );
+                            } else {
                                 debug!(?sequence, base_sequence = deflated.base_sequence);
-
-                                Err(Error::Api(ErrorCode::OutOfOrderSequenceNumber))
                             }
-
-                            sequence if sequence > deflated.base_sequence => {
-                                debug!(?sequence, base_sequence = deflated.base_sequence);
-
-                                Err(Error::Api(ErrorCode::DuplicateSequenceNumber))
-                            }
-
-                            _ => Ok(()),
-                        }
+                        })
                     })
                     .await
+                    .inspect(|check| {
+                        IDEMPOTENT_SEQUENCE_CHECK.add(
+                            1,
+                            &[
+                                KeyValue::new("cluster", self.cluster.clone()),
+                                KeyValue::new("outcome", check.outcome()),
+                            ],
+                        );
+                    })
                     .inspect_err(|err| {
-                        if matches!(
-                            err,
-                            Error::Api(ErrorCode::OutOfOrderSequenceNumber)
-                                | Error::Api(ErrorCode::DuplicateSequenceNumber)
-                        ) {
-                            return;
+                        if let Some(outcome) = produced_batches::rejected_outcome(err) {
+                            IDEMPOTENT_SEQUENCE_CHECK.add(
+                                1,
+                                &[
+                                    KeyValue::new("cluster", self.cluster.clone()),
+                                    KeyValue::new("outcome", outcome),
+                                ],
+                            );
+                        } else {
+                            error!(?err, transaction_id, ?topition);
                         }
-
-                        error!(?err, transaction_id, ?topition);
                     })?;
+
+                if let SequenceCheck::Duplicate { base_offset } = check {
+                    debug!(
+                        base_offset,
+                        producer_id = deflated.producer_id,
+                        base_sequence = deflated.base_sequence,
+                        transaction_id,
+                        ?topition
+                    );
+                    return Ok(base_offset);
+                }
             }
 
             let watermark = self.watermark_for(topition)?;
@@ -2229,44 +2330,46 @@ impl Storage for DynoStore {
                             return Err(Error::Api(ErrorCode::UnknownProducerId));
                         };
 
-                        let Some(mut current) = pd.sequences.last_entry() else {
-                            debug!(last_entry = ?pd.sequences.last_entry());
+                        let Some(current_epoch) =
+                            pd.sequences.last_key_value().map(|(epoch, _)| *epoch)
+                        else {
+                            debug!(producer_id);
                             return Err(Error::Api(ErrorCode::UnknownServerError));
                         };
 
-                        if current.key() != &producer_epoch {
-                            debug!(current = ?current.key(), producer_epoch);
+                        if current_epoch != producer_epoch {
+                            debug!(current_epoch, producer_epoch);
                             return Err(Error::Api(ErrorCode::ProducerFenced));
                         }
 
-                        let sequences = current.get_mut();
-                        debug!(?sequences);
+                        let sequence = pd.next_sequence(producer_epoch, topition);
 
-                        match sequences
-                            .entry(topition.topic.clone())
-                            .or_default()
-                            .entry(topition.partition)
-                            .or_default()
+                        // A concurrent retry of the same batch can be stored and
+                        // advance the sequence first. This write is then a second
+                        // copy, and the client gets an error for it instead of
+                        // the duplicate's offset.
+                        if let SequenceCheck::Duplicate { .. } = produced_batches::check_sequence(
+                            sequence,
+                            pd.remembered_batches(producer_epoch, topition),
+                            base_sequence,
+                            last_offset_delta,
+                        )
+                        .inspect_err(|_| debug!(sequence, base_sequence))?
                         {
-                            sequence if *sequence < base_sequence => {
-                                debug!(?sequence, base_sequence);
-
-                                Err(Error::Api(ErrorCode::OutOfOrderSequenceNumber))
-                            }
-
-                            sequence if *sequence > base_sequence => {
-                                debug!(?sequence, base_sequence);
-
-                                Err(Error::Api(ErrorCode::DuplicateSequenceNumber))
-                            }
-
-                            sequence => {
-                                debug!(?sequence, delta = last_offset_delta + 1);
-
-                                *sequence += last_offset_delta + 1;
-                                Ok(())
-                            }
+                            debug!(sequence, base_sequence);
+                            return Err(Error::Api(ErrorCode::DuplicateSequenceNumber));
                         }
+
+                        debug!(sequence, delta = last_offset_delta + 1);
+                        pd.advance(
+                            producer_epoch,
+                            topition,
+                            base_sequence,
+                            last_offset_delta,
+                            offset,
+                        );
+
+                        Ok(())
                     })
                     .await
                     .inspect(|outcome| debug!(transaction_id, ?topition, ?outcome))
@@ -3322,6 +3425,7 @@ impl Storage for DynoStore {
                                 if let Some(previous) = meta.producers.get_mut(&previous_id) {
                                     previous.sequences =
                                         BTreeMap::from([(i16::MAX, BTreeMap::new())]);
+                                    previous.batches.clear();
                                 }
 
                                 info!(
@@ -4098,6 +4202,17 @@ fn object_store_error_name(error: &object_store::Error) -> &'static str {
         }
     }
 }
+
+/// Counts the idempotent batches that a produce checks against the producer's sequence, by
+/// `outcome`: see [`SequenceCheck::outcome`] and [`produced_batches::rejected_outcome`].
+static IDEMPOTENT_SEQUENCE_CHECK: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("nisshi_produce_idempotent_sequence_check")
+        .with_description(
+            "Idempotent produce batches checked against the producer's sequence, by outcome",
+        )
+        .build()
+});
 
 static POST_WRITE_ADVANCE_FAILED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
