@@ -153,6 +153,21 @@ jobs:
           FOSSA_LICENSING_BLOCK: ${{ vars.FOSSA_LICENSING_BLOCK }}
           IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
         run: ${{ github.workspace }}/trusted/.github/scripts/guardian-scan-context.sh
+      # A trunk run scans only a commit that is on main. Every trunk job runs
+      # in `guardian-trunk` and runs tools that execute code from the scanned
+      # tree, so this check guards them all before any of them starts. A
+      # release tag passes because release.yml's `on-main` job requires the
+      # tagged commit to be on main.
+      - name: Require a trunk commit on main
+        if: ${{ fromJSON(steps.ctx.outputs.is_trunk) }}
+        working-directory: scan
+        env:
+          SHA: ${{ steps.ctx.outputs.sha }}
+        run: |
+          if ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "::error::$SHA is not on main, so it does not run as trunk"
+            exit 1
+          fi
 
   # Every scan job skips unless `scan` is true: not a fork PR, a Dependabot PR
   # or a merge queue entry. Off trunk the guards are all REPORT-only, so a
