@@ -54,3 +54,10 @@ jobs:
             chore
             revert
           requireScope: false
+          # The pattern accepts an optional Jira key in front of the header,
+          # as in `SOL-123: fix(sql): summary`. Solace's autobots service
+          # reads the key from the title to check the ticket and to move it
+          # on when the PR merges. The type stays required, because the
+          # changelog is drafted from these commit subjects.
+          headerPattern: '^(?:[A-Z][A-Z0-9]+-[0-9]+: )?(\w*)(?:\(([\w$.\-*/ ]*)\))?!?: (.*)$'
+          headerPatternCorrespondence: type, scope, subject

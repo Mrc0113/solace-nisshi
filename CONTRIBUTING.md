@@ -100,6 +100,26 @@ type(scope): summary
   `feat(sql)!: summary`, and say what breaks in the description.
 - GitHub's Revert button titles its pull request `Revert "<title>"`, which
   fails the check. Retitle it `revert: <title>`.
+- A Jira key may come before the type, for example
+  `SOL-123: fix(sql): summary`. See the next section.
+
+### Linking a Jira ticket
+
+Solace maintainers track work in Jira, and Solace's autobots service links a
+pull request to a ticket through a Jira key in its title. The key can lead
+the title (`SOL-123: fix(sql): summary`) or follow the type
+(`fix(sql): SOL-123 summary`). Autobots reads only the title, not the
+description or the commits.
+
+When the title has a key, autobots posts three statuses on the pull request:
+`autobots/pr-checker/jira-found`, `jira-assignee-found`, and
+`jira-status-check`. They report whether the ticket exists, has an assignee,
+and is in an in-progress status. None of them is a required check, so they
+never block a merge. A pull request without a key, from an outside
+contributor or Dependabot for example, merges as usual.
+
+When a pull request with a key merges, autobots moves the ticket on in its
+Jira workflow. A SOL ticket, for example, closes as Done.
 
 ## Releases
 
